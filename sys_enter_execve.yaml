@@ -1,0 +1,74 @@
+programs:
+  # Count execve() syscalls by file executed
+  - name: execve
+    metrics:
+      counters:
+        - name: tracepoint_syscalls_execve
+          help: Calls to execve()
+          table: files
+          labels:
+            - name: file_execed
+              size: 64
+              decoders:
+                - name: string
+                - name: regexp
+                  regexps:
+                    - ^/usr/.*$
+    tracepoints:
+      syscalls:sys_enter_execve: tracepoint__syscalls__sys_enter_execve
+    code: |
+
+      struct callargs {
+          char file[64];
+      };
+
+      BPF_HASH(files, struct callargs);
+
+
+      // Generates function tracepoint__syscalls__sys_enter_execve
+      TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
+
+          struct callargs f={};
+          u64 i=0,k=0;
+          u64 *v;
+          
+          // copy argument and manually 0-pad the rest of char[] after the first \0
+          // because: bpf_probe_read_user_str() does: 
+          // " In case the string length is smaller than size, the target is not padded with further NULL bytes."
+          // ...and random chars after first \0 trigger " was collected before with the same name and label values" issue
+          // don't know of a better way to do this so... 
+
+          bpf_probe_read_user_str(&f.file, sizeof(f.file), (char *) args->filename);
+
+          for(int j=0; j<64; j++) {
+              if(k!=0 || f.file[j]==0) {
+                  k=1;
+                  f.file[j]=0;
+              }
+          }
+
+          // can we avoid doing this lookup?
+          // why now? because: 
+          // "When using map.atomic_increment() to operate on a BPF map of type BPF_MAP_TYPE_HASH, map.atomic_increment() does not guarantee the atomicity of the operation when the specified key does not exist."
+
+          v=files.lookup_or_try_init(&f, &i);
+
+          if(v==NULL) {
+              // goes to: `cat /sys/kernel/debug/tracing/trace_pipe`
+              bpf_trace_printk("ebpf: map full!\n");
+              return 0;
+          }
+          else {
+              //bpf_trace_printk("ebpf: increment /%s/ counter value %d!\n", f.file, *(v));
+              //for(int j=0; j<24; j++) {
+              //      bpf_trace_printk("file[%d] %d\n", j, f.file[j]);
+              //}
+              // hitting " was collected before with the same name and label values" perhaps atomicity? no, uniqueness, see above
+              //(*v)++;
+              // also seen with this...
+              files.atomic_increment(f);
+          }
+
+          // bpf_trace_printk("ebpf: file %s counter %lu \n", f.file, *v );
+          return 0;
+      }
