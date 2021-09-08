@@ -1,0 +1,88 @@
+# Count number of times a file was open()-ed
+#
+# Code developed and tested to work with:
+#
+# CentOS Linux release 7.9.2009 (Core)
+# 3.10.0-1160.36.2.el7.x86_64
+# bcc-0.10.0-1.el7.x86_64
+#
+programs:
+  - name: open
+    metrics:
+      counters:
+        - name: tracepoint_syscalls_open
+          help: Calls to open()
+          table: files
+          labels:
+            - name: file_opened
+              size: 128
+              decoders:
+                - name: string
+                #- name: regexp
+                #  regexps:
+                #    - ^/usr/.*$
+    tracepoints:
+      syscalls:sys_enter_open: tracepoint__syscalls__sys_enter_open
+    code: |
+
+      // 256 leads to error:
+      // "Looks like the BPF stack limit of 512 bytes is exceeded. Please move large on stack variables into BPF per-cpu array map."
+      #define LENGTH 128
+
+      struct callargs {
+          char file[LENGTH];
+      };
+
+      BPF_HASH(files, struct callargs);
+
+
+      // Generates function tracepoint__syscalls__sys_enter_open
+      TRACEPOINT_PROBE(syscalls, sys_enter_open) {
+
+          struct callargs f={};
+          u64 i=0,k=0;
+          u64 *v;
+          
+          // copy argument and manually 0-pad the rest of char[] after the first \0
+          // because: bpf_probe_read_user_str() does: 
+          // " In case the string length is smaller than size, the target is not padded with further NULL bytes."
+          // ...and random chars after first \0 trigger " was collected before with the same name and label values" issue
+          // don't know of a better way to do this so... 
+
+          // rh 7.9 support missing
+          //bpf_probe_read_user_str(&f.file, sizeof(f.file), (char *) args->filename);
+          bpf_probe_read(&f.file, sizeof(f.file), (char *) args->filename);
+
+          // rh 7.9 support missing
+          // loops not allowed? in 3.10 how do you do this then?
+          // ...unroll? works.
+          #pragma unroll
+          for(int j=0; j<LENGTH; j++) {
+              if(k!=0 || f.file[j]==0) {
+                  k=1;
+                  f.file[j]=0;
+              }
+          }
+
+          // can we avoid doing this lookup?
+          // why are we doing it now? because: 
+          // "When using map.atomic_increment() to operate on a BPF map of type BPF_MAP_TYPE_HASH, map.atomic_increment() does not guarantee the atomicity of the operation when the specified key does not exist."
+
+          // rh 7.9 support missing
+          //v=files.lookup_or_try_init(&f, &i);
+          v=files.lookup_or_init(&f, &i);
+
+          if(v==NULL) {
+              // goes to: `cat /sys/kernel/debug/tracing/trace_pipe`
+              bpf_trace_printk("ebpf: map full!\n");
+              return 0;
+          }
+          else {
+              // rh 7.9 support missing
+              //files.atomic_increment(f);
+              files.increment(f);
+          }
+
+          // bpf_trace_printk("ebpf: file %s counter %lu \n", f.file, *v );
+          return 0;
+      }
